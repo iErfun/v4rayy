@@ -3,6 +3,9 @@
 Collects public V2Ray/Xray subscription sources, resolves each node's endpoint,
 and assigns the country from multiple independent GeoIP providers.
 
+**v2.1** — rate-limit safe: batch providers first (`countries.dev` + `ip-api.com`),
+single providers only when needed, exponential backoff + circuit breaker on 429.
+
 ## Sources
 
 - Au1rxx/free-vpn-subscriptions
@@ -21,12 +24,21 @@ For every node:
 
 1. Extract hostname/IP.
 2. Resolve all public A/AAAA addresses.
-3. Query multiple GeoIP providers.
-4. Combine independent results using weighted consensus.
-5. Cache the result.
-6. Replace the original remark with `XX 🇽🇽`.
+3. Query batch GeoIP providers first (`countries.dev`, `ip-api.com`).
+4. Only if batch consensus is weak, query single-IP providers (`ipwho.is`, `ipapi.co`) with rate limiting.
+5. Combine independent results using weighted consensus.
+6. Cache the result (7 days).
+7. Replace the original remark with `XX 🇽🇽`.
 
 This means a source saying `RU` does not force the result to be Russia.
+
+## Rate-limit handling
+
+- Batch endpoints preferred (fewer requests).
+- Delays between calls for single providers.
+- Exponential backoff on HTTP 429.
+- Circuit breaker: after several consecutive 429s a provider is disabled for the rest of the run.
+- Cached IPs are never re-queried within TTL.
 
 ## Output
 

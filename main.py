@@ -23,6 +23,15 @@ RETRIES = 3
 GEO_BATCH_SIZE = 100
 CACHE_TTL = 7 * 24 * 60 * 60
 
+# Soft rate-limits (seconds between calls / batches)
+IPWHO_DELAY = 1.2          # ~50 req/min max
+IPAPI_DELAY = 1.2          # ~50 req/min max
+IPAPI_COM_BATCH_DELAY = 4.5  # free batch = 15 req/min
+COUNTRIES_DEV_DELAY = 0.3
+
+# After this many consecutive 429s, disable a provider for the rest of the run
+PROVIDER_429_CIRCUIT = 5
+
 # Public collector sources.
 # Source metadata is NEVER trusted for the final country.
 SOURCES = [
@@ -75,9 +84,13 @@ SOURCES = [
 
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "country-subscription-builder/2.0",
+    "User-Agent": "country-subscription-builder/2.1",
     "Accept": "*/*",
 })
+
+# Per-provider circuit breakers (consecutive 429 count)
+_provider_429 = defaultdict(int)
+_provider_disabled = set()
 
 
 def get(url, **kwargs):
@@ -98,6 +111,24 @@ def get(url, **kwargs):
                 time.sleep(attempt * 2)
 
     raise RuntimeError(f"GET failed: {url} -> {last_error}")
+
+
+def _is_429(exc):
+    if isinstance(exc, requests.HTTPError) and exc.response is not None:
+        return exc.response.status_code == 429
+    text = str(exc).lower()
+    return "429" in text or "too many requests" in text
+
+
+def _mark_429(provider):
+    _provider_429[provider] += 1
+    if _provider_429[provider] >= PROVIDER_429_CIRCUIT:
+        _provider_disabled.add(provider)
+        print(f"[GEO] {provider} disabled for this run (too many 429s)")
+
+
+def _clear_429(provider):
+    _provider_429[provider] = 0
 
 
 # ============================================================
@@ -373,162 +404,347 @@ def cache_valid(entry):
 
 
 # ============================================================
-# GEO PROVIDER: countries.dev
+# GEO PROVIDER: countries.dev  (batch, high rate limit)
 # ============================================================
 
 def geo_countries_dev(ips):
     results = {}
+    provider = "countries.dev"
+
+    if provider in _provider_disabled:
+        return results
 
     for start in range(0, len(ips), GEO_BATCH_SIZE):
         batch = ips[start:start + GEO_BATCH_SIZE]
 
-        try:
-            response = SESSION.post(
-                "https://countries.dev/ip",
-                json=batch,
-                timeout=30,
-            )
-            response.raise_for_status()
-            data = response.json()
-
-            if isinstance(data, list):
-                for item in data:
-                    if not isinstance(item, dict):
-                        continue
-
-                    ip = item.get("ip") or item.get("address")
-                    code = (
-                        item.get("country_code")
-                        or item.get("countryCode")
-                        or item.get("iso_code")
-                        or item.get("isoCode")
+        for attempt in range(1, RETRIES + 1):
+            try:
+                response = SESSION.post(
+                    "https://countries.dev/ip",
+                    json=batch,
+                    timeout=30,
+                )
+                if response.status_code == 429:
+                    raise requests.HTTPError(
+                        f"429 Client Error: Too Many Requests for url: {response.url}",
+                        response=response,
                     )
+                response.raise_for_status()
+                data = response.json()
+                _clear_429(provider)
 
-                    if ip and code:
-                        results[str(ip)] = {
-                            "country": str(code).upper(),
-                            "provider": "countries.dev",
-                        }
+                if isinstance(data, list):
+                    for item in data:
+                        if not isinstance(item, dict):
+                            continue
 
-            elif isinstance(data, dict):
-                for ip, item in data.items():
-                    if isinstance(item, dict):
+                        ip = item.get("ip") or item.get("address")
                         code = (
                             item.get("country_code")
                             or item.get("countryCode")
                             or item.get("iso_code")
                             or item.get("isoCode")
                         )
+                        # nested country object
+                        if not code and isinstance(item.get("country"), dict):
+                            code = (
+                                item["country"].get("alpha2Code")
+                                or item["country"].get("cca2")
+                            )
 
-                        if code:
+                        if ip and code:
                             results[str(ip)] = {
                                 "country": str(code).upper(),
-                                "provider": "countries.dev",
+                                "provider": provider,
                             }
 
-                    elif isinstance(item, str):
-                        results[str(ip)] = {
-                            "country": item.upper(),
-                            "provider": "countries.dev",
-                        }
+                elif isinstance(data, dict):
+                    for ip, item in data.items():
+                        if isinstance(item, dict):
+                            code = (
+                                item.get("country_code")
+                                or item.get("countryCode")
+                                or item.get("iso_code")
+                                or item.get("isoCode")
+                            )
+                            if not code and isinstance(item.get("country"), dict):
+                                code = (
+                                    item["country"].get("alpha2Code")
+                                    or item["country"].get("cca2")
+                                )
 
-        except Exception as exc:
-            print(f"[GEO] countries.dev failed: {exc}")
+                            if code:
+                                results[str(ip)] = {
+                                    "country": str(code).upper(),
+                                    "provider": provider,
+                                }
 
-        time.sleep(0.25)
+                        elif isinstance(item, str):
+                            results[str(ip)] = {
+                                "country": item.upper(),
+                                "provider": provider,
+                            }
+
+                break  # success
+
+            except Exception as exc:
+                if _is_429(exc):
+                    _mark_429(provider)
+                    wait = min(30, attempt * 5)
+                    print(f"[GEO] countries.dev 429, sleep {wait}s")
+                    time.sleep(wait)
+                    if provider in _provider_disabled:
+                        return results
+                else:
+                    print(f"[GEO] countries.dev failed: {exc}")
+                    if attempt < RETRIES:
+                        time.sleep(attempt * 2)
+                    else:
+                        break
+
+        time.sleep(COUNTRIES_DEV_DELAY)
 
     return results
 
 
 # ============================================================
-# GEO PROVIDER: ipwho.is
+# GEO PROVIDER: ip-api.com batch  (free, HTTP, 15 batch/min)
+# ============================================================
+
+def geo_ipapi_com_batch(ips):
+    """
+    Free non-commercial batch endpoint.
+    Max 100 IPs per request, ~15 requests/minute.
+    """
+    results = {}
+    provider = "ip-api.com"
+
+    if provider in _provider_disabled:
+        return results
+
+    fields = "status,country,countryCode,city,regionName,as,org,isp,query"
+
+    for start in range(0, len(ips), GEO_BATCH_SIZE):
+        batch = ips[start:start + GEO_BATCH_SIZE]
+        payload = [{"query": ip, "fields": fields} for ip in batch]
+
+        for attempt in range(1, RETRIES + 1):
+            try:
+                response = SESSION.post(
+                    "http://ip-api.com/batch",
+                    json=payload,
+                    timeout=30,
+                )
+                if response.status_code == 429:
+                    raise requests.HTTPError(
+                        f"429 Client Error: Too Many Requests for url: {response.url}",
+                        response=response,
+                    )
+                response.raise_for_status()
+                data = response.json()
+                _clear_429(provider)
+
+                # Respect rate-limit headers when present
+                rl = response.headers.get("X-Rl")
+                ttl = response.headers.get("X-Ttl")
+                if rl is not None and ttl is not None:
+                    try:
+                        if int(rl) <= 1:
+                            sleep_for = max(int(ttl), 1)
+                            print(f"[GEO] ip-api.com rate window low, sleep {sleep_for}s")
+                            time.sleep(sleep_for)
+                    except ValueError:
+                        pass
+
+                if isinstance(data, list):
+                    for item in data:
+                        if not isinstance(item, dict):
+                            continue
+                        if item.get("status") != "success":
+                            continue
+                        ip = item.get("query")
+                        code = item.get("countryCode")
+                        if ip and code:
+                            results[str(ip)] = {
+                                "country": str(code).upper(),
+                                "country_name": item.get("country"),
+                                "city": item.get("city"),
+                                "region": item.get("regionName"),
+                                "asn": item.get("as"),
+                                "org": item.get("org"),
+                                "isp": item.get("isp"),
+                                "provider": provider,
+                            }
+
+                break
+
+            except Exception as exc:
+                if _is_429(exc):
+                    _mark_429(provider)
+                    wait = min(60, attempt * 8)
+                    print(f"[GEO] ip-api.com 429, sleep {wait}s")
+                    time.sleep(wait)
+                    if provider in _provider_disabled:
+                        return results
+                else:
+                    print(f"[GEO] ip-api.com batch failed: {exc}")
+                    if attempt < RETRIES:
+                        time.sleep(attempt * 2)
+                    else:
+                        break
+
+        time.sleep(IPAPI_COM_BATCH_DELAY)
+
+    return results
+
+
+# ============================================================
+# GEO PROVIDER: ipwho.is  (single, rate-limited)
 # ============================================================
 
 def geo_ipwho(ip):
-    try:
-        response = SESSION.get(
-            f"https://ipwho.is/{ip}",
-            timeout=REQUEST_TIMEOUT,
-        )
-        response.raise_for_status()
-        data = response.json()
-
-        if not data.get("success", True):
-            return None
-
-        code = data.get("country_code")
-
-        if not code:
-            return None
-
-        connection = data.get("connection") or {}
-
-        return {
-            "country": str(code).upper(),
-            "country_name": data.get("country"),
-            "city": data.get("city"),
-            "region": data.get("region"),
-            "asn": connection.get("asn"),
-            "org": connection.get("org"),
-            "isp": connection.get("isp"),
-            "source": "ipwho.is",
-        }
-
-    except Exception as exc:
-        print(f"[GEO] ipwho.is {ip}: {exc}")
+    provider = "ipwho.is"
+    if provider in _provider_disabled:
         return None
+
+    for attempt in range(1, RETRIES + 1):
+        try:
+            response = SESSION.get(
+                f"https://ipwho.is/{ip}",
+                timeout=REQUEST_TIMEOUT,
+            )
+            if response.status_code == 429:
+                raise requests.HTTPError(
+                    f"429 Client Error: Too Many Requests for url: {response.url}",
+                    response=response,
+                )
+            response.raise_for_status()
+            data = response.json()
+            _clear_429(provider)
+
+            if not data.get("success", True):
+                return None
+
+            code = data.get("country_code")
+            if not code:
+                return None
+
+            connection = data.get("connection") or {}
+
+            time.sleep(IPWHO_DELAY)
+            return {
+                "country": str(code).upper(),
+                "country_name": data.get("country"),
+                "city": data.get("city"),
+                "region": data.get("region"),
+                "asn": connection.get("asn"),
+                "org": connection.get("org"),
+                "isp": connection.get("isp"),
+                "source": provider,
+            }
+
+        except Exception as exc:
+            if _is_429(exc):
+                _mark_429(provider)
+                wait = min(45, attempt * 6)
+                print(f"[GEO] ipwho.is {ip}: 429, sleep {wait}s")
+                time.sleep(wait)
+                if provider in _provider_disabled:
+                    return None
+            else:
+                print(f"[GEO] ipwho.is {ip}: {exc}")
+                if attempt < RETRIES:
+                    time.sleep(attempt * 2)
+                else:
+                    return None
+
+    return None
 
 
 # ============================================================
-# GEO PROVIDER: ipapi.co
+# GEO PROVIDER: ipapi.co  (single, rate-limited)
 # ============================================================
 
 def geo_ipapi(ip):
-    try:
-        response = SESSION.get(
-            f"https://ipapi.co/{ip}/json/",
-            timeout=REQUEST_TIMEOUT,
-        )
-        response.raise_for_status()
-        data = response.json()
-
-        code = data.get("country_code")
-
-        if not code:
-            return None
-
-        return {
-            "country": str(code).upper(),
-            "country_name": data.get("country_name"),
-            "city": data.get("city"),
-            "region": data.get("region"),
-            "asn": data.get("asn"),
-            "org": data.get("org"),
-            "isp": data.get("org"),
-            "source": "ipapi.co",
-        }
-
-    except Exception as exc:
-        print(f"[GEO] ipapi.co {ip}: {exc}")
+    provider = "ipapi.co"
+    if provider in _provider_disabled:
         return None
+
+    for attempt in range(1, RETRIES + 1):
+        try:
+            response = SESSION.get(
+                f"https://ipapi.co/{ip}/json/",
+                timeout=REQUEST_TIMEOUT,
+            )
+            if response.status_code == 429:
+                raise requests.HTTPError(
+                    f"429 Client Error: Too Many Requests for url: {response.url}",
+                    response=response,
+                )
+            response.raise_for_status()
+            data = response.json()
+            _clear_429(provider)
+
+            # ipapi.co returns {"error": true, ...} on limit
+            if data.get("error"):
+                reason = str(data.get("reason", "")).lower()
+                if "rate" in reason or "limit" in reason:
+                    _mark_429(provider)
+                    print(f"[GEO] ipapi.co rate limited: {data.get('reason')}")
+                    time.sleep(10)
+                    return None
+                return None
+
+            code = data.get("country_code")
+            if not code:
+                return None
+
+            time.sleep(IPAPI_DELAY)
+            return {
+                "country": str(code).upper(),
+                "country_name": data.get("country_name"),
+                "city": data.get("city"),
+                "region": data.get("region"),
+                "asn": data.get("asn"),
+                "org": data.get("org"),
+                "isp": data.get("org"),
+                "source": provider,
+            }
+
+        except Exception as exc:
+            if _is_429(exc):
+                _mark_429(provider)
+                wait = min(45, attempt * 6)
+                print(f"[GEO] ipapi.co {ip}: 429, sleep {wait}s")
+                time.sleep(wait)
+                if provider in _provider_disabled:
+                    return None
+            else:
+                print(f"[GEO] ipapi.co {ip}: {exc}")
+                if attempt < RETRIES:
+                    time.sleep(attempt * 2)
+                else:
+                    return None
+
+    return None
 
 
 # ============================================================
 # GEO RESOLUTION / CONSENSUS
 # ============================================================
 
-def merge_geo(ip, countries_result, cache):
+def merge_geo(ip, batch_results, cache):
     """
     Build a multi-provider result.
 
     Weight:
       countries.dev = 3
-      ipwho.is      = 3
-      ipapi.co      = 3
+      ip-api.com    = 3
+      ipwho.is      = 2
+      ipapi.co      = 2
 
-    Additional evidence:
-      ASN/org is kept for diagnostics but does NOT override
-      multiple independent GeoIP results.
+    Single-IP providers are only called when batch providers
+    did not already produce a confident answer (to avoid 429s).
     """
 
     if ip in cache and cache_valid(cache[ip]):
@@ -536,39 +752,51 @@ def merge_geo(ip, countries_result, cache):
 
     votes = Counter()
     provider_results = {}
+    who = {}
+    api = {}
 
-    countries_item = countries_result.get(ip)
+    # --- batch results already fetched ---
+    for provider_key, weight in (
+        ("countries.dev", 3),
+        ("ip-api.com", 3),
+    ):
+        item = batch_results.get(provider_key, {}).get(ip)
+        if item and item.get("country"):
+            code = item["country"]
+            votes[code] += weight
+            provider_results[provider_key] = code
 
-    if countries_item:
-        code = countries_item.get("country")
-        if code:
-            votes[code] += 3
-            provider_results["countries.dev"] = code
+    # If we already have strong agreement from batch providers,
+    # skip the slow/rate-limited single endpoints.
+    need_singles = True
+    if votes:
+        best_code, best_score = votes.most_common(1)[0]
+        total = sum(votes.values())
+        if best_score >= 3 and (best_score / total) >= 0.66:
+            need_singles = False
 
-    who = geo_ipwho(ip)
+    if need_singles:
+        who = geo_ipwho(ip) or {}
+        if who.get("country"):
+            code = who["country"]
+            votes[code] += 2
+            provider_results["ipwho.is"] = code
 
-    if who and who.get("country"):
-        code = who["country"]
-        votes[code] += 3
-        provider_results["ipwho.is"] = code
-
-    api = geo_ipapi(ip)
-
-    if api and api.get("country"):
-        code = api["country"]
-        votes[code] += 3
-        provider_results["ipapi.co"] = code
+        api = geo_ipapi(ip) or {}
+        if api.get("country"):
+            code = api["country"]
+            votes[code] += 2
+            provider_results["ipapi.co"] = code
 
     if votes:
         ordered = votes.most_common()
-
         best_code, best_score = ordered[0]
         total_score = sum(votes.values())
 
-        # Confidence is based on independent provider agreement.
         confidence = round(best_score / total_score, 4)
 
-        # A unanimous 3-provider result gets a hard confidence floor.
+        if len(provider_results) >= 2 and len(votes) == 1:
+            confidence = max(confidence, 0.95)
         if len(provider_results) >= 3 and len(votes) == 1:
             confidence = max(confidence, 0.98)
 
@@ -577,8 +805,8 @@ def merge_geo(ip, countries_result, cache):
             "confidence": confidence,
             "votes": dict(votes),
             "providers": provider_results,
-            "ipwho": who or {},
-            "ipapi": api or {},
+            "ipwho": who if isinstance(who, dict) else {},
+            "ipapi": api if isinstance(api, dict) else {},
             "checked_at": int(time.time()),
         }
 
@@ -590,8 +818,8 @@ def merge_geo(ip, countries_result, cache):
         "confidence": 0.0,
         "votes": {},
         "providers": {},
-        "ipwho": who or {},
-        "ipapi": api or {},
+        "ipwho": who if isinstance(who, dict) else {},
+        "ipapi": api if isinstance(api, dict) else {},
         "checked_at": int(time.time()),
     }
 
@@ -603,7 +831,7 @@ def merge_geo(ip, countries_result, cache):
 # NODE GEOLOCATION
 # ============================================================
 
-def geolocate_node(address, cache, countries_results):
+def geolocate_node(address, cache, batch_results):
     ips = resolve_all(address)
 
     if not ips:
@@ -618,14 +846,13 @@ def geolocate_node(address, cache, countries_results):
     country_votes = Counter()
 
     for ip in ips:
-        geo = merge_geo(ip, countries_results, cache)
+        geo = merge_geo(ip, batch_results, cache)
         details[ip] = geo
 
         code = geo.get("country")
         confidence = float(geo.get("confidence", 0))
 
         if code:
-            # Multiple A/AAAA addresses get weighted by confidence.
             country_votes[code] += confidence
 
     if not country_votes:
@@ -834,8 +1061,8 @@ def write_output(country_nodes, all_nodes):
 
 def main():
     print("=" * 70)
-    print("Country Subscription Builder 2.0")
-    print("Multi-source + multi-GeoIP + dynamic country support")
+    print("Country Subscription Builder 2.1")
+    print("Multi-source + multi-GeoIP + rate-limit safe")
     print("=" * 70)
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -876,11 +1103,20 @@ def main():
 
     print(f"[+] New GeoIP lookups: {len(uncached_ips)}")
 
-    # Fast batch provider first.
-    countries_results = {}
+    # ---------- Batch providers first (fast + rate-limit friendly) ----------
+    batch_results = {
+        "countries.dev": {},
+        "ip-api.com": {},
+    }
 
     if uncached_ips:
-        countries_results = geo_countries_dev(uncached_ips)
+        print("[GEO] batch: countries.dev ...")
+        batch_results["countries.dev"] = geo_countries_dev(uncached_ips)
+        print(f"[GEO] countries.dev resolved: {len(batch_results['countries.dev'])}")
+
+        print("[GEO] batch: ip-api.com ...")
+        batch_results["ip-api.com"] = geo_ipapi_com_batch(uncached_ips)
+        print(f"[GEO] ip-api.com resolved: {len(batch_results['ip-api.com'])}")
 
     # Build the final node country.
     country_nodes = defaultdict(list)
@@ -895,7 +1131,7 @@ def main():
         geo = geolocate_node(
             address,
             cache,
-            countries_results,
+            batch_results,
         )
 
         code = geo.get("country")
