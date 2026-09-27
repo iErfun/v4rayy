@@ -2,7 +2,7 @@ name: Update VPN subscriptions
 
 on:
   schedule:
-    - cron: "17 * * * *"
+    - cron: "10 * * * *"
   workflow_dispatch:
 
 permissions:
